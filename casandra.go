@@ -16,7 +16,7 @@ import (
 )
 
 // ================================
-// CONEXIÓN A CASSANDRA
+// CONEXIÓN A CASSANDRA ACTUALIZADA PARA ASTRA
 // ================================
 
 type CassandraConnection struct {
@@ -27,8 +27,29 @@ type CassandraConnection struct {
 func NewCassandraConnection(hosts []string) (*CassandraConnection, error) {
 	cluster := gocql.NewCluster(hosts...)
 	cluster.Consistency = gocql.Quorum
-	cluster.Timeout = 10 * time.Second
-	cluster.ConnectTimeout = 10 * time.Second
+	cluster.Timeout = 30 * time.Second
+	cluster.ConnectTimeout = 30 * time.Second
+	cluster.Port = 9042
+	
+	// Configurar keyspace si está especificado
+	if keyspace := os.Getenv("CASSANDRA_KEYSPACE"); keyspace != "" {
+		cluster.Keyspace = keyspace
+	}
+	
+	// Para Astra DB - usar Client ID y Client Secret
+	if username := os.Getenv("CASSANDRA_USERNAME"); username != "" {
+		cluster.Authenticator = gocql.PasswordAuthenticator{
+			Username: username, // Client ID
+			Password: os.Getenv("CASSANDRA_PASSWORD"), // Client Secret
+		}
+	}
+	
+	// SSL requerido para Astra DB
+	if os.Getenv("CASSANDRA_SSL") == "true" {
+		cluster.SslOpts = &gocql.SslOptions{
+			EnableHostVerification: false,
+		}
+	}
 	
 	session, err := cluster.CreateSession()
 	if err != nil {
@@ -557,10 +578,22 @@ type AnalysisResponse struct {
 var cassandraConn *CassandraConnection
 
 func setupAPI() *gin.Engine {
+	// Configurar Gin para producción
+	if os.Getenv("PORT") != "" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	
 	r := gin.Default()
 
+	// CORS más permisivo para producción
 	config := cors.DefaultConfig()
-	config.AllowOrigins = []string{"http://localhost:3000", "http://localhost:5173"}
+	if os.Getenv("PORT") != "" {
+		// En producción, permitir todos los orígenes
+		config.AllowAllOrigins = true
+	} else {
+		// En desarrollo, solo localhost
+		config.AllowOrigins = []string{"http://localhost:3000", "http://localhost:5173"}
+	}
 	config.AllowMethods = []string{"GET", "POST", "OPTIONS"}
 	config.AllowHeaders = []string{"*"}
 	r.Use(cors.New(config))
@@ -650,37 +683,67 @@ func isDigit(ch byte) bool {
 }
 
 // ================================
-// MAIN
+// MAIN FUNCTION ACTUALIZADA
 // ================================
 
 func main() {
-	// Intentar conectar a Cassandra
-	hosts := []string{"127.0.0.1"}
-	var err error
-	cassandraConn, err = NewCassandraConnection(hosts)
-	if err != nil {
-		fmt.Printf("⚠️  No se pudo conectar a Cassandra: %v\n", err)
-		fmt.Println("El analizador funcionará sin ejecución")
+	// Configurar hosts según el entorno
+	var hosts []string
+	
+	// Detectar si estamos en producción (Render)
+	if os.Getenv("PORT") != "" {
+		// PRODUCCIÓN - usar Astra DB
+		fmt.Println("🌐 Modo: PRODUCCIÓN (Render)")
+		if astraHost := os.Getenv("CASSANDRA_HOST"); astraHost != "" {
+			hosts = []string{astraHost}
+			fmt.Printf("📡 Intentando conectar a Astra DB: %s\n", astraHost)
+			fmt.Printf("🔑 Username: %s\n", os.Getenv("CASSANDRA_USERNAME"))
+			fmt.Printf("🗂️  Keyspace: %s\n", os.Getenv("CASSANDRA_KEYSPACE"))
+		} else {
+			fmt.Println("ℹ️  No hay configuración de Cassandra - funcionando en modo análisis únicamente")
+		}
 	} else {
-		fmt.Println("✅ Conectado a Cassandra")
+		// DESARROLLO LOCAL - usar Docker local
+		fmt.Println("💻 Modo: DESARROLLO LOCAL")
+		hosts = []string{"127.0.0.1"}
+		fmt.Println("🐳 Intentando conectar a Cassandra local (Docker)")
+	}
+	
+	// Intentar conexión a Cassandra
+	if len(hosts) > 0 {
+		var err error
+		cassandraConn, err = NewCassandraConnection(hosts)
+		if err != nil {
+			fmt.Printf("⚠️  No se pudo conectar a Cassandra: %v\n", err)
+			fmt.Println("El analizador funcionará sin ejecución")
+			cassandraConn = nil
+		} else {
+			fmt.Println("✅ Conectado a Cassandra exitosamente")
+		}
 	}
 
-	if len(os.Args) > 1 && os.Args[1] == "server" {
-		fmt.Println("🚀 Iniciando API server...")
-		fmt.Println("📡 Puerto: 8080")
-		fmt.Println("🌐 Frontend: http://localhost:3000")
-		fmt.Println("🔍 Health: http://localhost:8080/health")
-
+	// Auto-detectar modo servidor
+	if os.Getenv("PORT") != "" || (len(os.Args) > 1 && os.Args[1] == "server") {
+		// MODO SERVIDOR
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		
+		fmt.Println("🚀 Iniciando servidor HTTP...")
+		fmt.Printf("📡 Puerto: %s\n", port)
+		fmt.Printf("🎯 Cassandra disponible: %v\n", cassandraConn != nil)
+		
 		r := setupAPI()
-		r.Run(":8080")
+		r.Run(":" + port)
 	} else {
+		// MODO CONSOLA INTERACTIVA (solo desarrollo)
 		fmt.Println("🔍 Analizador + Executor Cassandra DB")
 		fmt.Println("Comandos: CQL, nodetool, cqlsh")
 		fmt.Println("Escribe 'exit' para salir")
 		fmt.Println("Para modo servidor: go run cassandra.go server\n")
 
 		scanner := bufio.NewScanner(os.Stdin)
-
 		for {
 			fmt.Print("> ")
 			if !scanner.Scan() {
