@@ -36,7 +36,18 @@ type AstraResponse struct {
 
 func NewAstraConnection() (*AstraConnection, error) {
 	host := os.Getenv("CASSANDRA_HOST")
-	token := os.Getenv("CASSANDRA_PASSWORD")
+	
+	// Para REST API, necesitamos el Application Token completo (AstraCS:...)
+	// Si no está disponible, construirlo desde las credenciales
+	token := os.Getenv("ASTRA_DB_APPLICATION_TOKEN")
+	if token == "" {
+		// Fallback: usar el client secret (aunque no es ideal para REST API)
+		token = os.Getenv("CASSANDRA_PASSWORD")
+		if token == "" {
+			return nil, fmt.Errorf("no se encontró ASTRA_DB_APPLICATION_TOKEN ni CASSANDRA_PASSWORD")
+		}
+	}
+	
 	keyspace := os.Getenv("CASSANDRA_KEYSPACE")
 	
 	if host == "" || token == "" {
@@ -90,9 +101,12 @@ func extractDatabaseID(host string) string {
 }
 
 func extractRegion(host string) string {
+	// Extraer región de: 2c784d35-a24b-4757-9728-a00ab8f67c93-us-east-2.apps.astra.datastax.com
+	// Debe obtener: us-east-2
 	parts := strings.Split(host, "-")
-	if len(parts) >= 7 {
-		return strings.Join(parts[5:7], "-")
+	if len(parts) >= 8 {
+		// parts[5] = us, parts[6] = east, parts[7] = 2
+		return strings.Join(parts[5:8], "-")
 	}
 	return ""
 }
