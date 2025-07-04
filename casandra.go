@@ -17,7 +17,7 @@ import (
 )
 
 // ================================
-// CONEXIÓN A CASSANDRA OPTIMIZADA PARA ASTRA DB
+// CONEXIÓN OPTIMIZADA PARA ASTRA DB
 // ================================
 
 type CassandraConnection struct {
@@ -27,20 +27,29 @@ type CassandraConnection struct {
 
 func NewCassandraConnection(hosts []string) (*CassandraConnection, error) {
 	cluster := gocql.NewCluster(hosts...)
-	cluster.Consistency = gocql.Quorum
-	cluster.Timeout = 15 * time.Second      // Timeout reducido
-	cluster.ConnectTimeout = 15 * time.Second // Timeout de conexión reducido
+	
+	// Configuración específica para Astra DB Cloud
+	cluster.Consistency = gocql.LocalQuorum
+	cluster.Timeout = 30 * time.Second
+	cluster.ConnectTimeout = 30 * time.Second
 	cluster.Port = 9042
 	
-	// Configuración específica para Astra DB
+	// Configuraciones críticas para Astra
 	cluster.DisableInitialHostLookup = true
 	cluster.IgnorePeerAddr = true
 	cluster.NumConns = 1
+	cluster.ProtoVersion = 4
+	cluster.Compressor = &gocql.SnappyCompressor{}
 	
-	// Configurar keyspace si está especificado
-	if keyspace := os.Getenv("CASSANDRA_KEYSPACE"); keyspace != "" {
-		cluster.Keyspace = keyspace
-		fmt.Printf("🗂️  Configurando keyspace: %s\n", keyspace)
+	// Configuración de reconexión
+	cluster.ReconnectInterval = 10 * time.Second
+	cluster.MaxPreparedStmts = 1000
+	cluster.MaxRoutingKeyInfo = 1000
+	
+	// Configurar keyspace DESPUÉS de la conexión inicial
+	keyspace := os.Getenv("CASSANDRA_KEYSPACE")
+	if keyspace != "" {
+		fmt.Printf("🗂️  Keyspace objetivo: %s\n", keyspace)
 	}
 	
 	// Para Astra DB - usar Client ID y Client Secret
@@ -52,27 +61,68 @@ func NewCassandraConnection(hosts []string) (*CassandraConnection, error) {
 		fmt.Printf("🔑 Configurando autenticación: %s\n", username)
 	}
 	
-	// SSL requerido para Astra DB
+	// SSL obligatorio para Astra DB
 	if os.Getenv("CASSANDRA_SSL") == "true" {
 		cluster.SslOpts = &gocql.SslOptions{
 			EnableHostVerification: false,
 			Config: &tls.Config{
 				InsecureSkipVerify: true,
 				ServerName:        hosts[0],
+				MinVersion:        tls.VersionTLS12,
+				MaxVersion:        tls.VersionTLS13,
+				CipherSuites: []uint16{
+					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				},
 			},
 		}
-		fmt.Println("🔒 SSL habilitado para Astra DB")
+		fmt.Println("🔒 SSL habilitado con configuración Astra")
 	}
 	
-	fmt.Printf("🔗 Intentando conexión a: %s:%d\n", hosts[0], cluster.Port)
-	fmt.Printf("⏰ Timeout configurado: %v\n", cluster.ConnectTimeout)
+	fmt.Printf("🔗 Conectando a: %s:%d\n", hosts[0], cluster.Port)
+	fmt.Printf("⏰ Timeout: %v\n", cluster.ConnectTimeout)
+	fmt.Printf("🔌 Protocolo: v%d\n", cluster.ProtoVersion)
 	
+	// Intentar conexión sin keyspace primero
 	session, err := cluster.CreateSession()
 	if err != nil {
-		return nil, fmt.Errorf("error conectando a Cassandra: %v", err)
+		return nil, fmt.Errorf("error conectando a Astra DB: %v", err)
 	}
 	
-	fmt.Println("✅ Conexión establecida exitosamente")
+	fmt.Println("✅ Conexión inicial establecida")
+	
+	// Ahora configurar el keyspace si es necesario
+	if keyspace != "" {
+		fmt.Printf("🗂️  Configurando keyspace: %s\n", keyspace)
+		err = session.Query(fmt.Sprintf("USE %s", keyspace)).Exec()
+		if err != nil {
+			// Si el keyspace no existe, intentar crearlo
+			fmt.Printf("⚠️  Keyspace '%s' no existe, intentando crear...\n", keyspace)
+			createKeyspaceQuery := fmt.Sprintf(`
+				CREATE KEYSPACE IF NOT EXISTS %s 
+				WITH replication = {
+					'class': 'SimpleStrategy', 
+					'replication_factor': 1
+				}`, keyspace)
+			
+			err = session.Query(createKeyspaceQuery).Exec()
+			if err != nil {
+				fmt.Printf("❌ Error creando keyspace: %v\n", err)
+			} else {
+				fmt.Printf("✅ Keyspace '%s' creado exitosamente\n", keyspace)
+				// Intentar usar el keyspace recién creado
+				err = session.Query(fmt.Sprintf("USE %s", keyspace)).Exec()
+				if err != nil {
+					fmt.Printf("⚠️  Error usando keyspace: %v\n", err)
+				}
+			}
+		} else {
+			fmt.Printf("✅ Usando keyspace: %s\n", keyspace)
+		}
+	}
+	
 	return &CassandraConnection{
 		session: session,
 		cluster: cluster,
@@ -86,43 +136,39 @@ func (c *CassandraConnection) Close() {
 }
 
 func (c *CassandraConnection) ExecuteQuery(query string) ([]map[string]interface{}, error) {
-	fmt.Printf("Ejecutando: %s\n", query)
+	fmt.Printf("🔍 Ejecutando: %s\n", query)
+	
+	// Limpiar query
+	query = strings.TrimSpace(query)
+	if strings.HasSuffix(query, ";") {
+		query = strings.TrimSuffix(query, ";")
+	}
 	
 	// Manejo especial para comando USE
-	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "USE") {
-		// Extraer el nombre del keyspace
-		parts := strings.Fields(strings.TrimSpace(query))
+	if strings.HasPrefix(strings.ToUpper(query), "USE") {
+		parts := strings.Fields(query)
 		if len(parts) >= 2 {
-			keyspace := strings.TrimSuffix(parts[1], ";")
-			
-			// Cerrar sesión actual
-			if c.session != nil {
-				c.session.Close()
-			}
-			
-			// Crear nueva sesión con el keyspace
-			c.cluster.Keyspace = keyspace
-			session, err := c.cluster.CreateSession()
+			keyspace := parts[1]
+			err := c.session.Query(fmt.Sprintf("USE %s", keyspace)).Exec()
 			if err != nil {
 				return nil, fmt.Errorf("no se puede usar el keyspace '%s': %v", keyspace, err)
 			}
-			
-			c.session = session
 			return []map[string]interface{}{{"message": fmt.Sprintf("Usando keyspace '%s'", keyspace)}}, nil
 		}
 		return nil, fmt.Errorf("sintaxis de USE inválida")
 	}
 	
-	// Para comandos que no devuelven resultados (CREATE, DROP, INSERT, etc.)
-	if strings.HasPrefix(strings.ToUpper(query), "CREATE") ||
-		strings.HasPrefix(strings.ToUpper(query), "DROP") ||
-		strings.HasPrefix(strings.ToUpper(query), "INSERT") ||
-		strings.HasPrefix(strings.ToUpper(query), "UPDATE") ||
-		strings.HasPrefix(strings.ToUpper(query), "DELETE") {
+	// Para comandos que no devuelven resultados
+	upperQuery := strings.ToUpper(query)
+	if strings.HasPrefix(upperQuery, "CREATE") ||
+		strings.HasPrefix(upperQuery, "DROP") ||
+		strings.HasPrefix(upperQuery, "INSERT") ||
+		strings.HasPrefix(upperQuery, "UPDATE") ||
+		strings.HasPrefix(upperQuery, "DELETE") {
 		
 		err := c.session.Query(query).Exec()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error ejecutando comando: %v", err)
 		}
 		return []map[string]interface{}{{"message": "Comando ejecutado exitosamente"}}, nil
 	}
@@ -142,24 +188,13 @@ func (c *CassandraConnection) ExecuteQuery(query string) ([]map[string]interface
 	}
 	
 	if err := iter.Close(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error en consulta: %v", err)
 	}
 	
 	return results, nil
 }
 
-func (c *CassandraConnection) UseKeyspace(keyspace string) error {
-	c.session.Close()
-	
-	c.cluster.Keyspace = keyspace
-	session, err := c.cluster.CreateSession()
-	if err != nil {
-		return err
-	}
-	
-	c.session = session
-	return nil
-}
+// [El resto del código permanece igual: TokenType, Lexer, Parser, etc.]
 
 // ================================
 // TOKENS SIMPLIFICADOS
@@ -615,7 +650,7 @@ func setupAPI() *gin.Engine {
 	config.AllowHeaders = []string{"*"}
 	r.Use(cors.New(config))
 
-	// Ruta raíz para evitar 404
+	// Ruta raíz
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Cassandra Command Analyzer + Executor API",
@@ -696,29 +731,12 @@ func analyzeAndExecuteCommand(input string) *AnalysisResponse {
 }
 
 // ================================
-// UTILIDADES
-// ================================
-
-func isWhitespace(ch byte) bool {
-	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
-}
-
-func isLetter(ch byte) bool {
-	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
-}
-
-func isDigit(ch byte) bool {
-	return ch >= '0' && ch <= '9'
-}
-
-// ================================
 // FUNCIONES AUXILIARES
 // ================================
 
-// Función para conectar a Cassandra en segundo plano
 func connectToCassandraAsync() {
 	if astraHost := os.Getenv("CASSANDRA_HOST"); astraHost != "" {
-		fmt.Printf("📡 Intentando conectar a Astra DB: %s\n", astraHost)
+		fmt.Printf("📡 Conectando a Astra DB: %s\n", astraHost)
 		fmt.Printf("🔑 Username: %s\n", os.Getenv("CASSANDRA_USERNAME"))
 		fmt.Printf("🗂️  Keyspace: %s\n", os.Getenv("CASSANDRA_KEYSPACE"))
 		
@@ -726,20 +744,19 @@ func connectToCassandraAsync() {
 		var err error
 		cassandraConn, err = NewCassandraConnection(hosts)
 		if err != nil {
-			fmt.Printf("⚠️  No se pudo conectar a Cassandra: %v\n", err)
+			fmt.Printf("❌ Error conectando a Cassandra: %v\n", err)
 			fmt.Println("El analizador funcionará sin ejecución")
 			cassandraConn = nil
 		} else {
-			fmt.Println("✅ Conectado a Cassandra exitosamente")
+			fmt.Println("🎉 ¡CONECTADO EXITOSAMENTE A ASTRA DB!")
 		}
 	} else {
-		fmt.Println("ℹ️  No hay configuración de Cassandra - funcionando en modo análisis únicamente")
+		fmt.Println("ℹ️  No hay configuración de Cassandra")
 	}
 	
 	fmt.Printf("🎯 Cassandra disponible: %v\n", cassandraConn != nil)
 }
 
-// Función para modo interactivo (desarrollo)
 func runInteractiveMode() {
 	fmt.Println("🔍 Analizador + Executor Cassandra DB")
 	fmt.Println("Comandos: CQL, nodetool, cqlsh")
@@ -812,6 +829,7 @@ func main() {
 		
 		// Iniciar conexión a Cassandra en goroutine (segundo plano)
 		go func() {
+			time.Sleep(2 * time.Second) // Esperar un poco para que el servidor inicie
 			connectToCassandraAsync()
 		}()
 		
