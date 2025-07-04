@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"os"
@@ -9,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"crypto/tls"  
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -17,7 +17,7 @@ import (
 )
 
 // ================================
-// CONEXIÓN A CASSANDRA ACTUALIZADA PARA ASTRA
+// CONEXIÓN A CASSANDRA OPTIMIZADA PARA ASTRA DB
 // ================================
 
 type CassandraConnection struct {
@@ -28,35 +28,51 @@ type CassandraConnection struct {
 func NewCassandraConnection(hosts []string) (*CassandraConnection, error) {
 	cluster := gocql.NewCluster(hosts...)
 	cluster.Consistency = gocql.Quorum
-	cluster.Timeout = 30 * time.Second
-	cluster.ConnectTimeout = 30 * time.Second
+	cluster.Timeout = 60 * time.Second
+	cluster.ConnectTimeout = 60 * time.Second
 	cluster.Port = 9042
+	
+	// Configuración específica para Astra DB
+	cluster.DisableInitialHostLookup = true
+	cluster.IgnorePeerAddr = true
+	cluster.NumConns = 1 // Reducir conexiones para Astra
 	
 	// Configurar keyspace si está especificado
 	if keyspace := os.Getenv("CASSANDRA_KEYSPACE"); keyspace != "" {
 		cluster.Keyspace = keyspace
+		fmt.Printf("🗂️  Configurando keyspace: %s\n", keyspace)
 	}
 	
 	// Para Astra DB - usar Client ID y Client Secret
 	if username := os.Getenv("CASSANDRA_USERNAME"); username != "" {
 		cluster.Authenticator = gocql.PasswordAuthenticator{
-			Username: username, // Client ID
-			Password: os.Getenv("CASSANDRA_PASSWORD"), // Client Secret
+			Username: username,
+			Password: os.Getenv("CASSANDRA_PASSWORD"),
 		}
+		fmt.Printf("🔑 Configurando autenticación: %s\n", username)
 	}
 	
 	// SSL requerido para Astra DB
 	if os.Getenv("CASSANDRA_SSL") == "true" {
 		cluster.SslOpts = &gocql.SslOptions{
 			EnableHostVerification: false,
+			Config: &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:        hosts[0],
+			},
 		}
+		fmt.Println("🔒 SSL habilitado para Astra DB")
 	}
+	
+	fmt.Printf("🔗 Intentando conexión a: %s:%d\n", hosts[0], cluster.Port)
+	fmt.Printf("⏰ Timeout configurado: %v\n", cluster.ConnectTimeout)
 	
 	session, err := cluster.CreateSession()
 	if err != nil {
 		return nil, fmt.Errorf("error conectando a Cassandra: %v", err)
 	}
 	
+	fmt.Println("✅ Conexión establecida exitosamente")
 	return &CassandraConnection{
 		session: session,
 		cluster: cluster,
@@ -599,6 +615,18 @@ func setupAPI() *gin.Engine {
 	config.AllowHeaders = []string{"*"}
 	r.Use(cors.New(config))
 
+	// Ruta raíz para evitar 404
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Cassandra Command Analyzer + Executor API",
+			"version": "1.0.0",
+			"endpoints": gin.H{
+				"health":  "/health",
+				"analyze": "/analyze",
+			},
+		})
+	})
+
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status":    "OK",
@@ -684,7 +712,7 @@ func isDigit(ch byte) bool {
 }
 
 // ================================
-// MAIN FUNCTION ACTUALIZADA
+// MAIN FUNCTION FINAL
 // ================================
 
 func main() {
