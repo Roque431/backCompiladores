@@ -65,8 +65,9 @@ func NewAstraConnection() (*AstraConnection, error) {
 		keyspace = "default_keyspace"
 	}
 	
-	baseURL := fmt.Sprintf("https://%s-%s.apps.astra.datastax.com/api/rest/v2/keyspaces/%s", 
-		databaseID, region, keyspace)
+	baseURL := fmt.Sprintf("https://%s/api/rest/v2/keyspaces/%s", cassandraHost, keyspace)
+
+		
 	
 	fmt.Printf("🌐 Conectando via REST API\n")
 	fmt.Printf("🆔 Database ID: %s\n", databaseID)
