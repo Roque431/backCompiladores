@@ -2,10 +2,7 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"regexp"
@@ -15,453 +12,140 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/gocql/gocql"
 )
 
 // ================================
-// CONEXIÓN A ASTRA DB VIA REST API
+// CONEXIÓN A CASSANDRA ACTUALIZADA PARA ASTRA
 // ================================
 
-type AstraConnection struct {
-	baseURL    string
-	token      string
-	keyspace   string
-	httpClient *http.Client
-	databaseID string
-	region     string
+type CassandraConnection struct {
+	session *gocql.Session
+	cluster *gocql.ClusterConfig
 }
 
-type AstraResponse struct {
-	Data []map[string]interface{} `json:"data"`
-}
-
-func NewAstraConnection() (*AstraConnection, error) {
-	host := os.Getenv("CASSANDRA_HOST")
+func NewCassandraConnection(hosts []string) (*CassandraConnection, error) {
+	cluster := gocql.NewCluster(hosts...)
+	cluster.Consistency = gocql.Quorum
+	cluster.Timeout = 30 * time.Second
+	cluster.ConnectTimeout = 30 * time.Second
+	cluster.Port = 9042
 	
-	// Para REST API, necesitamos el Application Token completo (AstraCS:...)
-	// Si no está disponible, construirlo desde las credenciales
-	token := os.Getenv("ASTRA_DB_APPLICATION_TOKEN")
-	if token == "" {
-		// Fallback: usar el client secret (aunque no es ideal para REST API)
-		token = os.Getenv("CASSANDRA_PASSWORD")
-		if token == "" {
-			return nil, fmt.Errorf("no se encontró ASTRA_DB_APPLICATION_TOKEN ni CASSANDRA_PASSWORD")
+	// Configurar keyspace si está especificado
+	if keyspace := os.Getenv("CASSANDRA_KEYSPACE"); keyspace != "" {
+		cluster.Keyspace = keyspace
+	}
+	
+	// Para Astra DB - usar Client ID y Client Secret
+	if username := os.Getenv("CASSANDRA_USERNAME"); username != "" {
+		cluster.Authenticator = gocql.PasswordAuthenticator{
+			Username: username, // Client ID
+			Password: os.Getenv("CASSANDRA_PASSWORD"), // Client Secret
 		}
 	}
 	
-	keyspace := os.Getenv("CASSANDRA_KEYSPACE")
-	
-	if host == "" || token == "" {
-		return nil, fmt.Errorf("configuración incompleta para Astra REST API")
+	// SSL requerido para Astra DB
+	if os.Getenv("CASSANDRA_SSL") == "true" {
+		cluster.SslOpts = &gocql.SslOptions{
+			EnableHostVerification: false,
+		}
 	}
 	
-	databaseID := extractDatabaseID(host)
-	region := extractRegion(host)
-	
-	if databaseID == "" || region == "" {
-		return nil, fmt.Errorf("no se pudo extraer database ID o región de: %s", host)
-	}
-	
-	if keyspace == "" {
-		keyspace = "default_keyspace"
-	}
-	
-	baseURL := fmt.Sprintf("https://%s/api/rest/v2/keyspaces/%s", 
-		databaseID, region, keyspace)
-	
-	fmt.Printf("🌐 Conectando via REST API\n")
-	fmt.Printf("🆔 Database ID: %s\n", databaseID)
-	fmt.Printf("🌍 Region: %s\n", region)
-	fmt.Printf("🗂️  Keyspace: %s\n", keyspace)
-	fmt.Printf("🔗 Base URL: %s\n", baseURL)
-	
-	conn := &AstraConnection{
-		baseURL:    baseURL,
-		token:      token,
-		keyspace:   keyspace,
-		databaseID: databaseID,
-		region:     region,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-	}
-	
-	err := conn.testConnection()
+	session, err := cluster.CreateSession()
 	if err != nil {
-		return nil, fmt.Errorf("error probando conexión: %v", err)
+		return nil, fmt.Errorf("error conectando a Cassandra: %v", err)
 	}
 	
-	fmt.Println("✅ Conexión REST API establecida exitosamente")
-	return conn, nil
+	return &CassandraConnection{
+		session: session,
+		cluster: cluster,
+	}, nil
 }
 
-func extractDatabaseID(host string) string {
-	parts := strings.Split(host, "-")
-	if len(parts) >= 5 {
-		return strings.Join(parts[:5], "-")
+func (c *CassandraConnection) Close() {
+	if c.session != nil {
+		c.session.Close()
 	}
-	return ""
 }
 
-func extractRegion(host string) string {
-	// Extraer región de: 2c784d35-a24b-4757-9728-a00ab8f67c93-us-east-2.apps.astra.datastax.com
-	// Debe obtener: us-east-2
-	parts := strings.Split(host, "-")
-	if len(parts) >= 8 {
-		// parts[5] = us, parts[6] = east, parts[7] = 2
-		return strings.Join(parts[5:8], "-")
-	}
-	return ""
-}
-
-func (a *AstraConnection) testConnection() error {
-	url := a.baseURL + "/tables"
+func (c *CassandraConnection) ExecuteQuery(query string) ([]map[string]interface{}, error) {
+	fmt.Printf("Ejecutando: %s\n", query)
 	
-	req, err := http.NewRequest("GET", url, nil)
+	// Manejo especial para comando USE
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "USE") {
+		// Extraer el nombre del keyspace
+		parts := strings.Fields(strings.TrimSpace(query))
+		if len(parts) >= 2 {
+			keyspace := strings.TrimSuffix(parts[1], ";")
+			
+			// Cerrar sesión actual
+			if c.session != nil {
+				c.session.Close()
+			}
+			
+			// Crear nueva sesión con el keyspace
+			c.cluster.Keyspace = keyspace
+			session, err := c.cluster.CreateSession()
+			if err != nil {
+				return nil, fmt.Errorf("no se puede usar el keyspace '%s': %v", keyspace, err)
+			}
+			
+			c.session = session
+			return []map[string]interface{}{{"message": fmt.Sprintf("Usando keyspace '%s'", keyspace)}}, nil
+		}
+		return nil, fmt.Errorf("sintaxis de USE inválida")
+	}
+	
+	// Para comandos que no devuelven resultados (CREATE, DROP, INSERT, etc.)
+	if strings.HasPrefix(strings.ToUpper(query), "CREATE") ||
+		strings.HasPrefix(strings.ToUpper(query), "DROP") ||
+		strings.HasPrefix(strings.ToUpper(query), "INSERT") ||
+		strings.HasPrefix(strings.ToUpper(query), "UPDATE") ||
+		strings.HasPrefix(strings.ToUpper(query), "DELETE") {
+		
+		err := c.session.Query(query).Exec()
+		if err != nil {
+			return nil, err
+		}
+		return []map[string]interface{}{{"message": "Comando ejecutado exitosamente"}}, nil
+	}
+	
+	// Para comandos SELECT y DESCRIBE
+	iter := c.session.Query(query).Iter()
+	defer iter.Close()
+	
+	var results []map[string]interface{}
+	
+	for {
+		row := make(map[string]interface{})
+		if !iter.MapScan(row) {
+			break
+		}
+		results = append(results, row)
+	}
+	
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	
+	return results, nil
+}
+
+func (c *CassandraConnection) UseKeyspace(keyspace string) error {
+	c.session.Close()
+	
+	c.cluster.Keyspace = keyspace
+	session, err := c.cluster.CreateSession()
 	if err != nil {
 		return err
 	}
 	
-	req.Header.Set("X-Cassandra-Token", a.token)
-	req.Header.Set("Accept", "application/json")
-	
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("error en test request: %v", err)
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode == 404 {
-		return a.createKeyspaceIfNotExists()
-	} else if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("error HTTP %d: %s", resp.StatusCode, string(body))
-	}
-	
-	fmt.Printf("✅ Keyspace '%s' existe y es accesible\n", a.keyspace)
+	c.session = session
 	return nil
 }
 
-func (a *AstraConnection) createKeyspaceIfNotExists() error {
-	fmt.Printf("🔨 Keyspace '%s' no existe, usando modo documento\n", a.keyspace)
-	return nil
-}
-
-func (a *AstraConnection) ExecuteQuery(query string) ([]map[string]interface{}, error) {
-	fmt.Printf("🔍 Ejecutando via REST: %s\n", query)
-	
-	query = strings.TrimSpace(query)
-	if strings.HasSuffix(query, ";") {
-		query = strings.TrimSuffix(query, ";")
-	}
-	
-	upperQuery := strings.ToUpper(query)
-	
-	if strings.HasPrefix(upperQuery, "SELECT") {
-		return a.executeSelect(query)
-	} else if strings.HasPrefix(upperQuery, "CREATE TABLE") {
-		return a.executeCreateTable(query)
-	} else if strings.HasPrefix(upperQuery, "INSERT") {
-		return a.executeInsert(query)
-	} else if strings.HasPrefix(upperQuery, "DROP TABLE") {
-		return a.executeDropTable(query)
-	} else if strings.HasPrefix(upperQuery, "CREATE KEYSPACE") {
-		return a.executeCreateKeyspace(query)
-	} else if strings.HasPrefix(upperQuery, "USE") {
-		return a.executeUse(query)
-	} else if strings.HasPrefix(upperQuery, "DESCRIBE") || strings.HasPrefix(upperQuery, "DESC") {
-		return a.executeDescribe(query)
-	}
-	
-	return a.executeGeneric(query)
-}
-
-func (a *AstraConnection) executeSelect(query string) ([]map[string]interface{}, error) {
-	tableName := extractTableNameFromSelect(query)
-	if tableName != "" {
-		url := fmt.Sprintf("%s/tables/%s/rows", a.baseURL, tableName)
-		
-		resp, err := a.makeRequest("GET", url, nil)
-		if err != nil {
-			return nil, err
-		}
-		
-		var result map[string]interface{}
-		if err := json.Unmarshal(resp, &result); err == nil {
-			if data, ok := result["data"].([]interface{}); ok {
-				var rows []map[string]interface{}
-				for _, row := range data {
-					if rowMap, ok := row.(map[string]interface{}); ok {
-						rows = append(rows, rowMap)
-					}
-				}
-				return rows, nil
-			}
-		}
-	}
-	
-	return a.executeDocumentQuery(query)
-}
-
-func (a *AstraConnection) executeCreateTable(query string) ([]map[string]interface{}, error) {
-	tableName := extractTableName(query)
-	
-	url := a.baseURL + "/tables"
-	
-	columns := parseCreateTableColumns(query)
-	primaryKey := extractPrimaryKey(query)
-	
-	payload := map[string]interface{}{
-		"name":              tableName,
-		"columnDefinitions": columns,
-		"primaryKey":        primaryKey,
-	}
-	
-	_, err := a.makeRequest("POST", url, payload)
-	if err != nil {
-		return nil, err
-	}
-	
-	return []map[string]interface{}{
-		{"message": fmt.Sprintf("Tabla '%s' creada exitosamente", tableName)},
-	}, nil
-}
-
-func (a *AstraConnection) executeInsert(query string) ([]map[string]interface{}, error) {
-	tableName := extractTableNameFromInsert(query)
-	values := parseInsertValues(query)
-	
-	url := fmt.Sprintf("%s/tables/%s/rows", a.baseURL, tableName)
-	
-	_, err := a.makeRequest("POST", url, values)
-	if err != nil {
-		return a.executeDocumentInsert(tableName, values)
-	}
-	
-	return []map[string]interface{}{
-		{"message": "Registro insertado exitosamente"},
-	}, nil
-}
-
-func (a *AstraConnection) executeDropTable(query string) ([]map[string]interface{}, error) {
-	tableName := extractTableNameFromDrop(query)
-	
-	url := fmt.Sprintf("%s/tables/%s", a.baseURL, tableName)
-	
-	_, err := a.makeRequest("DELETE", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	
-	return []map[string]interface{}{
-		{"message": fmt.Sprintf("Tabla '%s' eliminada exitosamente", tableName)},
-	}, nil
-}
-
-func (a *AstraConnection) executeCreateKeyspace(query string) ([]map[string]interface{}, error) {
-	keyspaceName := extractKeyspaceName(query)
-	
-	return []map[string]interface{}{
-		{"message": fmt.Sprintf("Keyspace '%s' - usar CQL Console para crear keyspaces", keyspaceName)},
-	}, nil
-}
-
-func (a *AstraConnection) executeUse(query string) ([]map[string]interface{}, error) {
-	parts := strings.Fields(query)
-	if len(parts) >= 2 {
-		newKeyspace := parts[1]
-		a.keyspace = newKeyspace
-		a.baseURL = fmt.Sprintf("https://%s-%s.apps.astra.datastax.com/api/rest/v2/keyspaces/%s", 
-			a.databaseID, a.region, newKeyspace)
-		
-		return []map[string]interface{}{
-			{"message": fmt.Sprintf("Usando keyspace '%s'", newKeyspace)},
-		}, nil
-	}
-	return nil, fmt.Errorf("sintaxis USE inválida")
-}
-
-func (a *AstraConnection) executeDescribe(query string) ([]map[string]interface{}, error) {
-	upperQuery := strings.ToUpper(query)
-	
-	if strings.Contains(upperQuery, "KEYSPACES") {
-		return []map[string]interface{}{
-			{"keyspace_name": a.keyspace},
-			{"keyspace_name": "system"},
-			{"keyspace_name": "system_auth"},
-		}, nil
-	} else {
-		url := a.baseURL + "/tables"
-		
-		resp, err := a.makeRequest("GET", url, nil)
-		if err != nil {
-			return nil, err
-		}
-		
-		var result map[string]interface{}
-		if err := json.Unmarshal(resp, &result); err != nil {
-			return nil, err
-		}
-		
-		return []map[string]interface{}{
-			{"message": fmt.Sprintf("Tablas en keyspace '%s'", a.keyspace)},
-		}, nil
-	}
-}
-
-func (a *AstraConnection) executeGeneric(query string) ([]map[string]interface{}, error) {
-	return []map[string]interface{}{
-		{"message": fmt.Sprintf("Comando procesado: %s", query)},
-	}, nil
-}
-
-func (a *AstraConnection) executeDocumentQuery(query string) ([]map[string]interface{}, error) {
-	return []map[string]interface{}{
-		{"message": "Query ejecutado (modo documento)"},
-	}, nil
-}
-
-func (a *AstraConnection) executeDocumentInsert(collection string, data map[string]interface{}) ([]map[string]interface{}, error) {
-	url := fmt.Sprintf("https://%s-%s.apps.astra.datastax.com/api/rest/v2/namespaces/%s/collections/%s", 
-		a.databaseID, a.region, a.keyspace, collection)
-	
-	documentData := map[string]interface{}{
-		"id":        generateUUID(),
-		"data":      data,
-		"timestamp": time.Now().Unix(),
-	}
-	
-	_, err := a.makeRequest("POST", url, documentData)
-	if err != nil {
-		return nil, err
-	}
-	
-	return []map[string]interface{}{
-		{"message": "Documento insertado exitosamente"},
-	}, nil
-}
-
-func (a *AstraConnection) makeRequest(method, url string, payload interface{}) ([]byte, error) {
-	var body io.Reader
-	
-	if payload != nil {
-		jsonData, err := json.Marshal(payload)
-		if err != nil {
-			return nil, err
-		}
-		body = bytes.NewBuffer(jsonData)
-	}
-	
-	req, err := http.NewRequest(method, url, body)
-	if err != nil {
-		return nil, err
-	}
-	
-	req.Header.Set("X-Cassandra-Token", a.token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error en request: %v", err)
-	}
-	defer resp.Body.Close()
-	
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("error HTTP %d: %s", resp.StatusCode, string(respBody))
-	}
-	
-	return respBody, nil
-}
-
-func (a *AstraConnection) Close() {
-	// No hay conexión persistente que cerrar en REST API
-}
-
 // ================================
-// FUNCIONES HELPER PARA PARSING
-// ================================
-
-func extractTableName(query string) string {
-	re := regexp.MustCompile(`CREATE TABLE\s+(\w+)`)
-	matches := re.FindStringSubmatch(strings.ToUpper(query))
-	if len(matches) > 1 {
-		return strings.ToLower(matches[1])
-	}
-	return "test_table"
-}
-
-func extractTableNameFromInsert(query string) string {
-	re := regexp.MustCompile(`INSERT INTO\s+(\w+)`)
-	matches := re.FindStringSubmatch(strings.ToUpper(query))
-	if len(matches) > 1 {
-		return strings.ToLower(matches[1])
-	}
-	return "test_table"
-}
-
-func extractTableNameFromSelect(query string) string {
-	re := regexp.MustCompile(`FROM\s+(\w+)`)
-	matches := re.FindStringSubmatch(strings.ToUpper(query))
-	if len(matches) > 1 {
-		return strings.ToLower(matches[1])
-	}
-	return ""
-}
-
-func extractTableNameFromDrop(query string) string {
-	re := regexp.MustCompile(`DROP TABLE\s+(\w+)`)
-	matches := re.FindStringSubmatch(strings.ToUpper(query))
-	if len(matches) > 1 {
-		return strings.ToLower(matches[1])
-	}
-	return "test_table"
-}
-
-func extractKeyspaceName(query string) string {
-	re := regexp.MustCompile(`CREATE KEYSPACE\s+(\w+)`)
-	matches := re.FindStringSubmatch(strings.ToUpper(query))
-	if len(matches) > 1 {
-		return strings.ToLower(matches[1])
-	}
-	return "test_keyspace"
-}
-
-func parseCreateTableColumns(query string) []map[string]interface{} {
-	return []map[string]interface{}{
-		{"name": "id", "typeDefinition": "uuid", "static": false},
-		{"name": "nombre", "typeDefinition": "text", "static": false},
-		{"name": "email", "typeDefinition": "text", "static": false},
-		{"name": "edad", "typeDefinition": "int", "static": false},
-	}
-}
-
-func extractPrimaryKey(query string) map[string]interface{} {
-	return map[string]interface{}{
-		"partitionKey": []string{"id"},
-	}
-}
-
-func parseInsertValues(query string) map[string]interface{} {
-	return map[string]interface{}{
-		"id":     generateUUID(),
-		"nombre": "Test User",
-		"email":  "test@example.com",
-		"edad":   25,
-	}
-}
-
-func generateUUID() string {
-	return fmt.Sprintf("%d-%d-%d-%d-%d", 
-		time.Now().Unix(), 
-		time.Now().Nanosecond()%1000000,
-		123, 456, 789)
-}
-
-// ================================
-// TOKENS Y ANALIZADORES
+// TOKENS SIMPLIFICADOS
 // ================================
 
 type TokenType int
@@ -489,6 +173,10 @@ type Token struct {
 	Column int       `json:"column"`
 }
 
+// ================================
+// ANALIZADOR LÉXICO SIMPLIFICADO
+// ================================
+
 type Lexer struct {
 	input    string
 	position int
@@ -503,6 +191,7 @@ func NewLexer(input string) *Lexer {
 func (l *Lexer) Tokenize() []Token {
 	var tokens []Token
 	
+	// Detectar tipo de comando al inicio
 	upperInput := strings.ToUpper(strings.TrimSpace(l.input))
 	
 	if strings.HasPrefix(upperInput, "NODETOOL") {
@@ -510,6 +199,7 @@ func (l *Lexer) Tokenize() []Token {
 	} else if strings.HasPrefix(upperInput, "CQLSH") {
 		return l.tokenizeCqlsh()
 	} else if l.isCQLCommand(upperInput) {
+		// Para comandos CQL, crear un solo token con todo el comando
 		tokens = append(tokens, Token{
 			Type:   CQL_COMMAND,
 			Value:  strings.TrimSpace(l.input),
@@ -520,6 +210,7 @@ func (l *Lexer) Tokenize() []Token {
 		return tokens
 	}
 	
+	// Fallback: tokenizar normalmente
 	return l.tokenizeDefault()
 }
 
@@ -622,6 +313,10 @@ func (l *Lexer) isNumber(word string) bool {
 	return err == nil
 }
 
+// ================================
+// ESTRUCTURAS DE COMANDOS
+// ================================
+
 type Command struct {
 	Type       string            `json:"type"`
 	Tool       string            `json:"tool"`
@@ -630,6 +325,10 @@ type Command struct {
 	Arguments  []string          `json:"arguments"`
 	CQLQuery   string            `json:"cql_query"`
 }
+
+// ================================
+// ANALIZADOR SINTÁCTICO SIMPLIFICADO
+// ================================
 
 type Parser struct {
 	tokens []Token
@@ -655,6 +354,7 @@ func (p *Parser) Parse() (*Command, []string) {
 		Arguments: []string{},
 	}
 
+	// Primer token determina el tipo de comando
 	token := p.tokens[0]
 	switch token.Type {
 	case NODETOOL:
@@ -672,6 +372,7 @@ func (p *Parser) Parse() (*Command, []string) {
 		cmd.Subcommand = strings.ToUpper(strings.Fields(token.Value)[0])
 		return cmd, errors
 	default:
+		// Intentar como CQL
 		cmd.Type = "cql"
 		cmd.Tool = "cql"
 		cmd.CQLQuery = p.input
@@ -685,15 +386,17 @@ func (p *Parser) Parse() (*Command, []string) {
 func (p *Parser) parseNodetoolCommand(cmd *Command) (*Command, []string) {
 	var errors []string
 	
+	// Parsear tokens de nodetool
 	for i := 1; i < len(p.tokens) && p.tokens[i].Type != EOF; i++ {
 		token := p.tokens[i]
 		
 		switch token.Type {
 		case FLAG:
 			flag := token.Value
+			// Buscar el valor del flag
 			if i+1 < len(p.tokens) && p.tokens[i+1].Type != FLAG && p.tokens[i+1].Type != EOF {
 				cmd.Flags[flag] = p.tokens[i+1].Value
-				i++
+				i++ // Saltar el valor
 			} else {
 				cmd.Flags[flag] = "true"
 			}
@@ -714,6 +417,7 @@ func (p *Parser) parseNodetoolCommand(cmd *Command) (*Command, []string) {
 func (p *Parser) parseCqlshCommand(cmd *Command) (*Command, []string) {
 	var errors []string
 	
+	// Parsear tokens de cqlsh
 	for i := 1; i < len(p.tokens) && p.tokens[i].Type != EOF; i++ {
 		token := p.tokens[i]
 		
@@ -733,6 +437,10 @@ func (p *Parser) parseCqlshCommand(cmd *Command) (*Command, []string) {
 	
 	return cmd, errors
 }
+
+// ================================
+// ANALIZADOR SEMÁNTICO
+// ================================
 
 type SemanticAnalyzer struct{}
 
@@ -849,7 +557,7 @@ func (s *SemanticAnalyzer) validateCqlsh(cmd *Command) ([]string, []string) {
 }
 
 // ================================
-// API Y SERVIDOR
+// API CON EJECUCIÓN
 // ================================
 
 type AnalysisRequest struct {
@@ -867,49 +575,35 @@ type AnalysisResponse struct {
 	Timestamp      time.Time                `json:"timestamp"`
 }
 
-var astraConn *AstraConnection
+var cassandraConn *CassandraConnection
 
 func setupAPI() *gin.Engine {
+	// Configurar Gin para producción
 	if os.Getenv("PORT") != "" {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	
 	r := gin.Default()
 
+	// CORS más permisivo para producción
 	config := cors.DefaultConfig()
 	if os.Getenv("PORT") != "" {
+		// En producción, permitir todos los orígenes
 		config.AllowAllOrigins = true
 	} else {
+		// En desarrollo, solo localhost
 		config.AllowOrigins = []string{"http://localhost:3000", "http://localhost:5173"}
 	}
 	config.AllowMethods = []string{"GET", "POST", "OPTIONS"}
 	config.AllowHeaders = []string{"*"}
 	r.Use(cors.New(config))
 
-	r.GET("/", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "Cassandra Command Analyzer + Executor API",
-			"version": "2.0.0",
-			"connection": "Astra DB REST API",
-			"endpoints": gin.H{
-				"health":  "/health",
-				"analyze": "/analyze",
-			},
-		})
-	})
-
 	r.GET("/health", func(c *gin.Context) {
-		connectionType := "none"
-		if astraConn != nil {
-			connectionType = "Astra REST API"
-		}
-		
 		c.JSON(http.StatusOK, gin.H{
-			"status":            "OK",
-			"service":           "Cassandra Command Analyzer + Executor",
-			"timestamp":         time.Now(),
-			"cassandra_connected": astraConn != nil,
-			"connection_type":   connectionType,
+			"status":    "OK",
+			"service":   "Cassandra Command Analyzer + Executor",
+			"timestamp": time.Now(),
+			"cassandra_connected": cassandraConn != nil,
 		})
 	})
 
@@ -957,12 +651,12 @@ func analyzeAndExecuteCommand(input string) *AnalysisResponse {
 	response.Warnings = warnings
 	response.Success = len(errors) == 0
 
-	// 4. Ejecutar si es válido y es CQL y tenemos conexión
-	if response.Success && cmd.Type == "cql" && astraConn != nil {
-		result, err := astraConn.ExecuteQuery(cmd.CQLQuery)
+	// 4. Ejecutar si es válido y es CQL
+	if response.Success && cmd.Type == "cql" && cassandraConn != nil {
+		result, err := cassandraConn.ExecuteQuery(cmd.CQLQuery)
 		if err != nil {
 			response.Success = false
-			response.Errors = append(response.Errors, "Error ejecutando en Astra DB: "+err.Error())
+			response.Errors = append(response.Errors, "Error ejecutando en Cassandra: "+err.Error())
 		} else {
 			response.Executed = true
 			response.ExecutionResult = result
@@ -973,87 +667,62 @@ func analyzeAndExecuteCommand(input string) *AnalysisResponse {
 }
 
 // ================================
-// FUNCIONES AUXILIARES
+// UTILIDADES
 // ================================
 
-func connectToAstraAsync() {
-	if os.Getenv("CASSANDRA_HOST") != "" {
-		fmt.Printf("📡 Conectando a Astra DB REST API...\n")
-		
-		var err error
-		astraConn, err = NewAstraConnection()
-		if err != nil {
-			fmt.Printf("❌ Error conectando a Astra REST API: %v\n", err)
-			fmt.Println("El analizador funcionará sin ejecución")
-			astraConn = nil
-		} else {
-			fmt.Println("🎉 ¡CONECTADO EXITOSAMENTE A ASTRA DB VIA REST API!")
-		}
-	} else {
-		fmt.Println("ℹ️  No hay configuración de Astra DB")
-	}
-	
-	fmt.Printf("🎯 Astra DB disponible: %v\n", astraConn != nil)
+func isWhitespace(ch byte) bool {
+	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
 }
 
-func runInteractiveMode() {
-	fmt.Println("🔍 Analizador + Executor Cassandra DB")
-	fmt.Println("Comandos: CQL, nodetool, cqlsh")
-	fmt.Println("Escribe 'exit' para salir")
-	fmt.Println("Para modo servidor: go run main.go server\n")
+func isLetter(ch byte) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+}
 
-	scanner := bufio.NewScanner(os.Stdin)
-	for {
-		fmt.Print("> ")
-		if !scanner.Scan() {
-			break
-		}
-
-		input := strings.TrimSpace(scanner.Text())
-		if input == "exit" {
-			break
-		}
-		if input == "" {
-			continue
-		}
-
-		response := analyzeAndExecuteCommand(input)
-
-		fmt.Printf("✅ Análisis: %v\n", response.Success)
-		if response.Command != nil {
-			fmt.Printf("Tipo: %s\n", response.Command.Type)
-			if response.Command.CQLQuery != "" {
-				fmt.Printf("CQL: %s\n", response.Command.CQLQuery)
-			}
-		}
-
-		if len(response.Errors) > 0 {
-			fmt.Println("❌ Errores:")
-			for _, err := range response.Errors {
-				fmt.Println("  -", err)
-			}
-		}
-
-		if len(response.Warnings) > 0 {
-			fmt.Println("⚠️  Advertencias:")
-			for _, warning := range response.Warnings {
-				fmt.Println("  -", warning)
-			}
-		}
-
-		if response.Executed {
-			fmt.Printf("🎯 Ejecutado en Astra DB: %d resultados\n", len(response.ExecutionResult))
-		}
-
-		fmt.Println()
-	}
+func isDigit(ch byte) bool {
+	return ch >= '0' && ch <= '9'
 }
 
 // ================================
-// MAIN FUNCTION
+// MAIN FUNCTION ACTUALIZADA
 // ================================
 
 func main() {
+	// Configurar hosts según el entorno
+	var hosts []string
+	
+	// Detectar si estamos en producción (Render)
+	if os.Getenv("PORT") != "" {
+		// PRODUCCIÓN - usar Astra DB
+		fmt.Println("🌐 Modo: PRODUCCIÓN (Render)")
+		if astraHost := os.Getenv("CASSANDRA_HOST"); astraHost != "" {
+			hosts = []string{astraHost}
+			fmt.Printf("📡 Intentando conectar a Astra DB: %s\n", astraHost)
+			fmt.Printf("🔑 Username: %s\n", os.Getenv("CASSANDRA_USERNAME"))
+			fmt.Printf("🗂️  Keyspace: %s\n", os.Getenv("CASSANDRA_KEYSPACE"))
+		} else {
+			fmt.Println("ℹ️  No hay configuración de Cassandra - funcionando en modo análisis únicamente")
+		}
+	} else {
+		// DESARROLLO LOCAL - usar Docker local
+		fmt.Println("💻 Modo: DESARROLLO LOCAL")
+		hosts = []string{"44.210.182.201"}
+		fmt.Println("🐳 Intentando conectar a Cassandra local (Docker)")
+	}
+	
+	// Intentar conexión a Cassandra
+	if len(hosts) > 0 {
+		var err error
+		cassandraConn, err = NewCassandraConnection(hosts)
+		if err != nil {
+			fmt.Printf("⚠️  No se pudo conectar a Cassandra: %v\n", err)
+			fmt.Println("El analizador funcionará sin ejecución")
+			cassandraConn = nil
+		} else {
+			fmt.Println("✅ Conectado a Cassandra exitosamente")
+		}
+	}
+
+	// Auto-detectar modo servidor
 	if os.Getenv("PORT") != "" || (len(os.Args) > 1 && os.Args[1] == "server") {
 		// MODO SERVIDOR
 		port := os.Getenv("PORT")
@@ -1061,38 +730,67 @@ func main() {
 			port = "8080"
 		}
 		
-		fmt.Println("🌐 Modo: PRODUCCIÓN (Render)")
 		fmt.Println("🚀 Iniciando servidor HTTP...")
 		fmt.Printf("📡 Puerto: %s\n", port)
+		fmt.Printf("🎯 Cassandra disponible: %v\n", cassandraConn != nil)
 		
-		// Iniciar conexión a Astra en segundo plano
-		go func() {
-			time.Sleep(2 * time.Second)
-			connectToAstraAsync()
-		}()
-		
-		// Iniciar servidor HTTP inmediatamente
 		r := setupAPI()
 		r.Run(":" + port)
-		
 	} else {
-		// MODO DESARROLLO LOCAL
-		fmt.Println("💻 Modo: DESARROLLO LOCAL")
-		
-		// Intentar conectar a Astra
-		var err error
-		astraConn, err = NewAstraConnection()
-		if err != nil {
-			fmt.Printf("⚠️  No se pudo conectar a Astra: %v\n", err)
-			fmt.Println("El analizador funcionará sin ejecución")
-		} else {
-			fmt.Println("✅ Conectado a Astra DB")
+		// MODO CONSOLA INTERACTIVA (solo desarrollo)
+		fmt.Println("🔍 Analizador + Executor Cassandra DB")
+		fmt.Println("Comandos: CQL, nodetool, cqlsh")
+		fmt.Println("Escribe 'exit' para salir")
+		fmt.Println("Para modo servidor: go run cassandra.go server\n")
+
+		scanner := bufio.NewScanner(os.Stdin)
+		for {
+			fmt.Print("> ")
+			if !scanner.Scan() {
+				break
+			}
+
+			input := strings.TrimSpace(scanner.Text())
+			if input == "exit" {
+				break
+			}
+			if input == "" {
+				continue
+			}
+
+			response := analyzeAndExecuteCommand(input)
+
+			fmt.Printf("✅ Análisis: %v\n", response.Success)
+			if response.Command != nil {
+				fmt.Printf("Tipo: %s\n", response.Command.Type)
+				if response.Command.CQLQuery != "" {
+					fmt.Printf("CQL: %s\n", response.Command.CQLQuery)
+				}
+			}
+
+			if len(response.Errors) > 0 {
+				fmt.Println("❌ Errores:")
+				for _, err := range response.Errors {
+					fmt.Println("  -", err)
+				}
+			}
+
+			if len(response.Warnings) > 0 {
+				fmt.Println("⚠️  Advertencias:")
+				for _, warning := range response.Warnings {
+					fmt.Println("  -", warning)
+				}
+			}
+
+			if response.Executed {
+				fmt.Printf("🎯 Ejecutado en Cassandra: %d resultados\n", len(response.ExecutionResult))
+			}
+
+			fmt.Println()
 		}
-		
-		runInteractiveMode()
 	}
 
-	if astraConn != nil {
-		astraConn.Close()
+	if cassandraConn != nil {
+		cassandraConn.Close()
 	}
 }
